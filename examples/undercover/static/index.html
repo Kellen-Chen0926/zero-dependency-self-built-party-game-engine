@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>谁是卧底</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #1a1a2e; color: #eee; min-height: 100vh; padding: 16px; }
+  button { border: none; border-radius: 10px; padding: 12px 18px; font-size: 16px;
+           cursor: pointer; background: #e94560; color: #fff; }
+  button:disabled { background: #555; color: #999; cursor: not-allowed; }
+  button.ghost { background: #333; color: #ccc; }
+  input, textarea { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid #444;
+           background: #0f0f23; color: #eee; font-size: 16px; }
+  .card { background: #16213e; border-radius: 14px; padding: 16px; margin-bottom: 12px; }
+  .title { font-size: 22px; font-weight: 700; text-align: center; margin: 12px 0; }
+  .muted { color: #8899aa; font-size: 13px; }
+  .big-word { font-size: 40px; font-weight: 800; text-align: center; color: #f5c518;
+              margin: 16px 0; letter-spacing: 4px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .player { padding: 8px 12px; border-radius: 8px; background: #1f2c4d; font-size: 14px; }
+  .player.sel { background: #e94560; color: #fff; }
+  .player.out { opacity: 0.4; text-decoration: line-through; }
+  .log { max-height: 140px; overflow-y: auto; font-size: 13px; color: #aab; line-height: 1.6; }
+  .chat-box { max-height: 160px; overflow-y: auto; font-size: 13px; line-height: 1.6; }
+  .chat-box b { color: #f5c518; }
+  .phase-tag { text-align: center; font-size: 14px; color: #8899aa; margin: 6px 0; }
+  .winner { font-size: 26px; font-weight: 800; text-align: center; margin: 12px 0; }
+  .desc-item { padding: 8px; border-bottom: 1px solid #233; font-size: 14px; }
+  .desc-item b { color: #7bdff2; margin-right: 8px; }
+  .hidden { display: none; }
+  .status { font-size: 12px; color: #667; text-align: center; margin: 8px 0; }
+</style>
+</head>
+<body>
+  <div id="home" class="hidden"></div>
+  <div id="lobby" class="hidden"></div>
+  <div id="describe" class="hidden"></div>
+  <div id="vote" class="hidden"></div>
+  <div id="reveal" class="hidden"></div>
+  <div id="over" class="hidden"></div>
+
+<script>
+const POLL_MS = 1500;
+let room = localStorage.getItem("uw_room") || "";
+let pid = localStorage.getItem("uw_pid") || "";
+let name = localStorage.getItem("uw_name") || "";
+let cid = localStorage.getItem("uw_cid") || (() => {
+  const c = "c" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  localStorage.setItem("uw_cid", c); return c;
+})();
+let s = null;
+let pollTimer = null;
+
+function $(id) { return document.getElementById(id); }
+function esc(t) { return (t == null ? "" : String(t)).replace(/[&<>"']/g, c =>
+  ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
+
+async function api(path, body) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 4000);
+  try {
+    const r = await fetch(path, {
+      method: body ? "POST" : "GET",
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+    return await r.json();
+  } finally { clearTimeout(to); }
+}
+
+function show(scr) {
+  ["home","lobby","describe","vote","reveal","over"].forEach(x => $(x).classList.add("hidden"));
+  $(scr).classList.remove("hidden");
+}
+
+function render() {
+  if (!s) return;
+  if (s.phase === "waiting") show("lobby");
+  else if (s.phase === "describe") show("describe");
+  else if (s.phase === "vote") show("vote");
+  else if (s.phase === "reveal") show("reveal");
+  else if (s.phase === "over") show("over");
+  if (s.phase === "waiting") renderLobby();
+  else if (s.phase === "describe") renderDescribe();
+  else if (s.phase === "vote") renderVote();
+  else if (s.phase === "reveal") renderReveal();
+  else if (s.phase === "over") renderOver();
+}
+
+function chatBox(s) {
+  return `<div class="card"><b>聊天</b><div class="chat-box" id="chat">` +
+    (s.chat || []).map(c => `<div><b>${esc(c.name)}：</b>${esc(c.text)}</div>`).join("") +
+    `</div><div class="row" style="margin-top:8px">
+      <input id="chatIn" placeholder="说点什么" maxlength="60">
+      <button onclick="sendChat()">发送</button></div></div>`;
+}
+async function sendChat() {
+  const el = $("chatIn"); const t = el.value.trim(); if (!t) return;
+  await api("/api/chat", { room, pid, text: t }); el.value = "";
+}
+
+// ---- 首页 ----
+function renderHome() {
+  $("home").innerHTML = `
+    <div class="title">🕵️ 谁是卧底</div>
+    <div class="card">
+      <div class="muted">昵称</div>
+      <input id="nameIn" value="${esc(name)}" placeholder="输入昵称" maxlength="12">
+      <div class="muted" style="margin-top:10px">创建房间（人数 4~10）</div>
+      <div class="row" style="margin:8px 0">
+        ${[4,5,6,7,8,9,10].map(n => `<button class="ghost" onclick="create(${n})">${n}人</button>`).join("")}
+      </div>
+      <div class="muted">或加入房间</div>
+      <div class="row" style="margin:8px 0">
+        <input id="roomIn" placeholder="房间号" maxlength="4" style="flex:1">
+        <button onclick="join()">加入</button>
+      </div>
+    </div>
+    <div class="status">玩家点链接即玩，无需下载</div>`;
+}
+
+async function create(n) {
+  name = $("nameIn").value.trim(); if (!name) return alert("先填昵称");
+  localStorage.setItem("uw_name", name);
+  const r = await api("/api/create", { name, player_count: n, client_id: cid });
+  if (!r.ok) return alert(r.error);
+  room = r.room_id; pid = r.pid;
+  localStorage.setItem("uw_room", room); localStorage.setItem("uw_pid", pid);
+  startPoll();
+}
+async function join() {
+  name = $("nameIn").value.trim(); if (!name) return alert("先填昵称");
+  const rid = $("roomIn").value.trim().toUpperCase(); if (!rid) return alert("填房间号");
+  localStorage.setItem("uw_name", name);
+  const r = await api("/api/join", { room: rid, pid, name, client_id: cid, password: "" });
+  if (!r.ok) return alert(r.error);
+  room = r.room_id; pid = r.pid;
+  localStorage.setItem("uw_room", room); localStorage.setItem("uw_pid", pid);
+  startPoll();
+}
+
+// ---- 大厅 ----
+function renderLobby() {
+  const me = s.me;
+  $("lobby").innerHTML = `
+    <div class="title">🕵️ 谁是卧底</div>
+    <div class="card">
+      <div class="phase-tag">房间号 <b style="color:#f5c518">${esc(s.room_id)}</b> ｜ 人数 ${s.players.length}/${s.player_count}</div>
+      <div class="row">${s.players.map(p => `<span class="player">${esc(p.name)}${p.id===me.id?"（我）":""}</span>`).join("")}</div>
+      ${me.is_host ? `<div style="margin-top:10px"><button ${s.players.length<s.player_count?"disabled":""}
+        onclick="startGame()">开始游戏</button></div>` : `<div class="status">等待房主开始…</div>`}
+    </div>
+    ${chatBox(s)}`;
+}
+async function startGame() { await api("/api/start", { room, pid }); }
+
+// ---- 描述 ----
+function renderDescribe() {
+  const me = s.me;
+  const myTurn = s.my_turn;
+  $("describe").innerHTML = `
+    <div class="title">第 ${s.round} 轮 · 描述</div>
+    <div class="card">
+      <div class="muted" style="text-align:center">你的词</div>
+      <div class="big-word">${esc(s.my_word)}</div>
+      <div class="muted" style="text-align:center">别说出词本身，描述它让别人猜</div>
+    </div>
+    <div class="card">
+      <div class="phase-tag">轮流描述：${(s.desc_order||[]).join(" → ")}</div>
+      <div>${(s.descs||[]).map(d => `<div class="desc-item"><b>${esc(d.name)}</b>${esc(d.text)}</div>`).join("")}</div>
+      ${myTurn ? `
+        <div style="margin-top:10px">
+          <input id="descIn" placeholder="用一句话描述你的词（不超过30字）" maxlength="30">
+          <button style="margin-top:8px" onclick="submitDesc()">提交描述</button>
+        </div>` :
+        `<div class="status">${s.current_desc_name ? "轮到 " + esc(s.current_desc_name) + " 描述" : ""}</div>`}
+    </div>
+    ${chatBox(s)}`;
+}
+async function submitDesc() {
+  const t = $("descIn").value.trim(); if (!t) return;
+  await api("/api/action", { room, pid, action: "describe", text: t });
+}
+
+// ---- 投票 ----
+let votePick = null;
+function renderVote() {
+  votePick = null;
+  const targets = (s.players || []).filter(p => p.id !== s.me.id && !p.left && !p.out);
+  $("vote").innerHTML = `
+    <div class="title">第 ${s.round} 轮 · 投票</div>
+    <div class="card">
+      <div>${(s.descs||[]).map(d => `<div class="desc-item"><b>${esc(d.name)}</b>${esc(d.text)}</div>`).join("")}</div>
+    </div>
+    <div class="card">
+      <div class="phase-tag">${s.voted ? "已投票，等待其他人…" : "选一个最像卧底的人"}</div>
+      <div class="row">${targets.map(p => `<button class="ghost player" id="tgt_${p.id}" onclick="pickVote('${p.id}')">${esc(p.name)}</button>`).join("")}</div>
+      ${!s.voted ? `<button style="margin-top:10px;width:100%" id="voteBtn" disabled onclick="submitVote()">确认投票</button>` : ""}
+    </div>
+    ${chatBox(s)}`;
+}
+function pickVote(id) {
+  votePick = id;
+  document.querySelectorAll("[id^=tgt_]").forEach(b => b.classList.remove("sel"));
+  $("tgt_" + id).classList.add("sel");
+  $("voteBtn").disabled = false;
+}
+async function submitVote() {
+  if (!votePick) return;
+  await api("/api/action", { room, pid, action: "vote", target: votePick });
+}
+
+// ---- 揭晓 ----
+function renderReveal() {
+  const lr = s.last_reveal;
+  $("reveal").innerHTML = `
+    <div class="title">第 ${s.round} 轮 · 揭晓</div>
+    <div class="card">
+      ${lr ? `<div class="winner" style="color:${lr.is_spy ? "#4ecca3" : "#f5c518"}">
+        ${esc(lr.name)} 是${lr.is_spy ? "卧底" : "平民"}</div>` : ""}
+      <div class="phase-tag">${lr && lr.is_spy ? "卧底被投出，平民获胜！" : "继续下一轮…"}</div>
+    </div>
+    ${chatBox(s)}`;
+}
+
+// ---- 结束 ----
+function renderOver() {
+  const w = s.words || {};
+  $("over").innerHTML = `
+    <div class="title">🏁 游戏结束</div>
+    <div class="card">
+      <div class="winner" style="color:${s.winner==="civilian" ? "#4ecca3" : "#e94560"}">
+        ${s.winner==="civilian" ? "平民阵营获胜！" : "卧底获胜！"}</div>
+      <div class="phase-tag">卧底是 <b style="color:#f5c518">${esc(s.spy_name)}</b></div>
+      <div class="row" style="justify-content:center;margin:12px 0">
+        <div class="player">平民词：${esc(w.civilian)}</div>
+        <div class="player">卧底词：${esc(w.spy)}</div>
+      </div>
+      ${s.me.is_host ? `<button style="width:100%" onclick="api('/api/restart',{room,pid})">再来一局</button>` : ""}
+    </div>
+    ${chatBox(s)}`;
+}
+
+// ---- 轮询 ----
+async function poll() {
+  const r = await api("/api/poll?room=" + encodeURIComponent(room) + "&pid=" + encodeURIComponent(pid));
+  if (r && r.phase) { s = r; render(); }
+}
+function startPoll() {
+  clearInterval(pollTimer);
+  poll();
+  pollTimer = setInterval(poll, POLL_MS);
+}
+
+// ---- 入口 ----
+if (room && pid) {
+  show("lobby");
+  startPoll();
+} else {
+  show("home");
+  renderHome();
+}
+</script>
+</body>
+</html>
