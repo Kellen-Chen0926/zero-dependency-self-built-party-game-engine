@@ -2,15 +2,17 @@
 # -*- coding: utf-8 -*-
 """party-engine —— 自建聚会游戏引擎（壳通用层）。
 
-把狼人杀、阿瓦隆两代游戏里验证过的「壳」抽成这一份，游戏侧只写「核」。
+把聚会游戏（狼人杀、阿瓦隆、谁是卧底等）里通用的「壳」抽成这一份，游戏侧只写「核」。
 
 壳（本文件负责，游戏不用管）：
 - ThreadingHTTPServer + threading.Lock + 前端轮询
 - 房间管理：create / join / start / restart / force / disband / leave
+- 身份鉴权：每个玩家一个服务端签发的 secret，代替可猜测的 id
 - 通用动作入口 /api/action（body.action 分发到游戏核）
 - 公共聊天 /api/chat
 - 静态文件服务（含音频格式嗅探）+ 防缓存头
 - 通用 player_view 公共字段 + 两段式确认/全员门（投票集合模式）
+- 基础防护：房间 TTL 回收、创建限流、请求体上限
 
 核（游戏侧写一个 Game 子类，覆盖钩子）：
 - config_for(player_count)   人数 -> 角色/阵营配置
@@ -26,6 +28,7 @@
 import json
 import os
 import random
+import secrets
 import string
 import threading
 import time
@@ -33,8 +36,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 
-def gen_id(n=4):
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
+# 安全边界：本引擎面向「半可信圈子」（朋友/熟人）的聚会游戏，不是面向陌生人的公网产品。
+ROOM_TTL = 3600        # 房间无心跳超过该秒数后自动回收
+RATE_WINDOW = 60       # 创建房间限流窗口（秒）
+RATE_LIMIT = 30        # 每个 IP 每窗口最多创建房间数
+MAX_BODY = 64 * 1024   # 请求体大小上限（字节）
+
+
+class AuthError(Exception):
+    """身份鉴权失败（单独一类，便于返回 403 而非 400）。"""
+
+
+def gen_id(n=4, alphabet=string.ascii_uppercase + string.digits):
+    """用加密安全随机源生成 id（房间号/玩家 id），避免可预测。"""
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def gen_secret():
+    """服务端签发的玩家身份凭证，客户端每次请求携带，替代可猜测的 pid。"""
+    return secrets.token_hex(16)
 
 
 def find_player(room, pid):
@@ -140,11 +160,13 @@ class Engine:
         self.base_dir = base_dir
         self.rooms = {}
         self.lock = threading.Lock()
+        self._create_ts = {}   # IP -> 创建时间戳列表，用于限流
 
     # ---- 房间 ----
-    def new_room(self, player_count, password, host_name, options, client_id=""):
+    def new_room(self, player_count, password, host_name, options):
+        self._sweep()
         host = {"id": gen_id(8), "name": host_name, "role": None, "seat": 0,
-                "left": False, "alive": True, "client_id": client_id}
+                "left": False, "alive": True, "secret": gen_secret()}
         room = {
             "id": gen_id(4),
             "password": password or "",
@@ -157,6 +179,7 @@ class Engine:
             "chat": [],
             "winner": None,
             "options": options,
+            "last_seen": time.time(),
         }
         self.game.new_room_state(room)
         self.rooms[room["id"]] = room
@@ -168,6 +191,25 @@ class Engine:
         room["log"] = []
         room["chat"] = []
         add_log(room, "游戏开始")
+
+    def _sweep(self):
+        """回收超过 ROOM_TTL 无心跳的房间，防止内存无限膨胀。"""
+        now = time.time()
+        dead = [rid for rid, r in self.rooms.items()
+                if now - r.get("last_seen", now) > ROOM_TTL]
+        for rid in dead:
+            del self.rooms[rid]
+
+    def _rate_limited(self, ip):
+        """基于 IP 的创建房间限流（滑动窗口）。"""
+        now = time.time()
+        ts = [t for t in self._create_ts.get(ip, []) if now - t < RATE_WINDOW]
+        if len(ts) >= RATE_LIMIT:
+            self._create_ts[ip] = ts
+            return True
+        ts.append(now)
+        self._create_ts[ip] = ts
+        return False
 
     # ---- view ----
     def player_view(self, room, pid):
@@ -185,7 +227,7 @@ class Engine:
             })
         view = {
             "room_id": room["id"],
-            "password": room["password"],
+            "has_password": bool(room["password"]),
             "phase": phase,
             "player_count": room["player_count"],
             "me": {"id": p["id"], "name": p["name"], "role": p.get("role"),
@@ -234,6 +276,8 @@ class Engine:
             def _read_body(self):
                 try:
                     n = int(self.headers.get("Content-Length", 0))
+                    if n > MAX_BODY:
+                        return None
                     return json.loads(self.rfile.read(n).decode("utf-8"))
                 except Exception:
                     return {}
@@ -259,16 +303,22 @@ class Engine:
                     q = parse_qs(parsed.query)
                     room_id = q.get("room", [""])[0].upper()
                     pid = q.get("pid", [""])[0]
+                    secret = q.get("secret", [""])[0]
                     with engine.lock:
                         room = engine.rooms.get(room_id)
                         if not room:
                             self._err("房间不存在", 404)
                             return
-                        engine.game.tick(room)
-                        view = engine.player_view(room, pid)
-                        if not view:
+                        p = find_player(room, pid)
+                        if not p:
                             self._err("玩家不存在", 404)
                             return
+                        if p.get("secret") != secret:
+                            self._err("身份验证失败", 403)
+                            return
+                        engine.game.tick(room)
+                        room["last_seen"] = time.time()
+                        view = engine.player_view(room, pid)
                     self._json(view)
                     return
                 if parsed.path.startswith("/static/"):
@@ -303,15 +353,23 @@ class Engine:
             def do_POST(self):
                 parsed = urlparse(self.path)
                 body = self._read_body()
+                if body is None:
+                    self._err("请求体过大", 413)
+                    return
                 with engine.lock:
                     try:
                         self._route(parsed.path, body)
+                    except AuthError as e:
+                        self._err(str(e), 403)
                     except Exception as e:
                         self._err(str(e), 400)
 
             def _route(self, path, b):
                 g = engine.game
                 if path == "/api/create":
+                    if engine._rate_limited(self.client_address[0]):
+                        self._err("操作太频繁，请稍后再试", 429)
+                        return
                     name = (b.get("name") or "").strip()[:12]
                     if not name:
                         self._err("昵称不能为空"); return
@@ -319,35 +377,28 @@ class Engine:
                     if not (g.min_players <= pc <= g.max_players):
                         self._err("人数必须为 %d~%d" % (g.min_players, g.max_players)); return
                     password = (b.get("password") or "").strip()[:12]
-                    cid = (b.get("client_id") or "").strip()[:32]
                     options = g.options_from_body(b)
-                    room = engine.new_room(pc, password, name, options, cid)
-                    self._ok(room_id=room["id"], pid=room["host_pid"])
+                    room = engine.new_room(pc, password, name, options)
+                    host = find_player(room, room["host_pid"])
+                    self._ok(room_id=room["id"], pid=host["id"], secret=host["secret"])
                 elif path == "/api/join":
                     room = self._room(b)
                     if room["phase"] != "waiting":
                         self._err("游戏已开始"); return
                     if room["password"] and b.get("password") != room["password"]:
                         self._err("密码错误"); return
-                    cid = (b.get("client_id") or "").strip()[:32]
-                    for x in room["players"]:
-                        if cid and x.get("client_id") == cid:
-                            self._ok(pid=x["id"], room_id=room["id"])
-                            return
                     if len(room["players"]) >= room["player_count"]:
                         self._err("房间已满"); return
                     name = (b.get("name") or "").strip()[:12]
                     if not name:
                         self._err("昵称不能为空"); return
                     p = {"id": gen_id(8), "name": name, "role": None, "seat": 0,
-                         "left": False, "alive": True, "client_id": cid}
+                         "left": False, "alive": True, "secret": gen_secret()}
                     room["players"].append(p)
                     add_log(room, "%s 加入了房间（%d/%d）" % (name, len(room["players"]), room["player_count"]))
-                    self._ok(pid=p["id"], room_id=room["id"])
+                    self._ok(pid=p["id"], room_id=room["id"], secret=p["secret"])
                 elif path == "/api/start":
-                    room = self._room(b)
-                    if room["host_pid"] != b.get("pid"):
-                        self._err("只有房主能开始"); return
+                    room = self._host(b)
                     if len(room["players"]) < room["player_count"]:
                         self._err("人数未满，无法开始"); return
                     engine.start_game(room)
@@ -361,9 +412,7 @@ class Engine:
                     engine.chat(room, p["id"], b.get("text"))
                     self._ok()
                 elif path == "/api/restart":
-                    room = self._room(b)
-                    if room["host_pid"] != b.get("pid"):
-                        self._err("只有房主能重开"); return
+                    room = self._host(b)
                     room["phase"] = "waiting"
                     for p in room["players"]:
                         p["role"] = None
@@ -376,15 +425,11 @@ class Engine:
                     add_log(room, "已重置，等待重新开始")
                     self._ok()
                 elif path == "/api/force":
-                    room = self._room(b)
-                    if room["host_pid"] != b.get("pid"):
-                        self._err("只有房主能推进"); return
+                    room = self._host(b)
                     g.force(room)
                     self._ok()
                 elif path == "/api/disband":
-                    room = self._room(b)
-                    if room["host_pid"] != b.get("pid"):
-                        self._err("只有房主能解散"); return
+                    room = self._host(b)
                     del engine.rooms[room["id"]]
                     self._ok()
                 elif path == "/api/leave":
@@ -420,7 +465,16 @@ class Engine:
                 p = find_player(room, b.get("pid"))
                 if not p:
                     raise Exception("玩家不存在")
+                if p.get("secret") != b.get("secret"):
+                    raise AuthError("身份验证失败")
                 return room, p
+
+            def _host(self, b):
+                room = self._room(b)
+                host = find_player(room, room["host_pid"])
+                if b.get("pid") != host["id"] or b.get("secret") != host["secret"]:
+                    raise AuthError("只有房主能操作")
+                return room
 
             def log_message(self, *args):
                 pass

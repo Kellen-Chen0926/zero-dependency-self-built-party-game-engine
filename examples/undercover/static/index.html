@@ -47,10 +47,7 @@ const POLL_MS = 1500;
 let room = localStorage.getItem("uw_room") || "";
 let pid = localStorage.getItem("uw_pid") || "";
 let name = localStorage.getItem("uw_name") || "";
-let cid = localStorage.getItem("uw_cid") || (() => {
-  const c = "c" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-  localStorage.setItem("uw_cid", c); return c;
-})();
+let secret = localStorage.getItem("uw_secret") || "";
 let s = null;
 let pollTimer = null;
 
@@ -65,7 +62,7 @@ async function api(path, body) {
     const r = await fetch(path, {
       method: body ? "POST" : "GET",
       headers: body ? { "Content-Type": "application/json" } : {},
-      body: body ? JSON.stringify(body) : undefined,
+      body: body ? JSON.stringify({ ...body, secret }) : undefined,
       signal: ctrl.signal,
     });
     return await r.json();
@@ -126,20 +123,20 @@ function renderHome() {
 async function create(n) {
   name = $("nameIn").value.trim(); if (!name) return alert("先填昵称");
   localStorage.setItem("uw_name", name);
-  const r = await api("/api/create", { name, player_count: n, client_id: cid });
+  const r = await api("/api/create", { name, player_count: n });
   if (!r.ok) return alert(r.error);
-  room = r.room_id; pid = r.pid;
-  localStorage.setItem("uw_room", room); localStorage.setItem("uw_pid", pid);
+  room = r.room_id; pid = r.pid; secret = r.secret;
+  localStorage.setItem("uw_room", room); localStorage.setItem("uw_pid", pid); localStorage.setItem("uw_secret", secret);
   startPoll();
 }
 async function join() {
   name = $("nameIn").value.trim(); if (!name) return alert("先填昵称");
   const rid = $("roomIn").value.trim().toUpperCase(); if (!rid) return alert("填房间号");
   localStorage.setItem("uw_name", name);
-  const r = await api("/api/join", { room: rid, pid, name, client_id: cid, password: "" });
+  const r = await api("/api/join", { room: rid, name, password: "" });
   if (!r.ok) return alert(r.error);
-  room = r.room_id; pid = r.pid;
-  localStorage.setItem("uw_room", room); localStorage.setItem("uw_pid", pid);
+  room = r.room_id; pid = r.pid; secret = r.secret;
+  localStorage.setItem("uw_room", room); localStorage.setItem("uw_pid", pid); localStorage.setItem("uw_secret", secret);
   startPoll();
 }
 
@@ -247,7 +244,7 @@ function renderOver() {
 
 // ---- 轮询 ----
 async function poll() {
-  const r = await api("/api/poll?room=" + encodeURIComponent(room) + "&pid=" + encodeURIComponent(pid));
+  const r = await api("/api/poll?room=" + encodeURIComponent(room) + "&pid=" + encodeURIComponent(pid) + "&secret=" + encodeURIComponent(secret));
   if (r && r.phase) { s = r; render(); }
 }
 function startPoll() {
@@ -257,7 +254,7 @@ function startPoll() {
 }
 
 // ---- 入口 ----
-if (room && pid) {
+if (room && pid && secret) {
   show("lobby");
   startPoll();
 } else {

@@ -3,6 +3,17 @@
 > Build a room-based multiplayer party game for phones by writing only a ~120-line "kernel".
 > No third-party dependencies — pure Python standard library.
 
+## When to use it
+
+A few situations it fits well — this is not an exhaustive list:
+
+- **No game master around.** Turn-based party games (Werewolf, Avalon, …) usually need someone to host. The engine plays that role: it deals, gates, and settles on its own, so a full table can start with nobody stuck running the game.
+- **No physical cards at hand.** Friends gather but no one brought a deck — a phone link turns everyone's screen into the table.
+- **Friends far away.** Expose a link through a tunnel and play a round with people you haven't seen in a while.
+- **Your own game idea.** Drop in the rules (write a `Game` subclass) and the engine builds the room, the polling, and the link — you ship a playable game without building the plumbing.
+
+It's a general shell, not tied to any one game — if an idea fits the "room + polling + turn-based" shape, the engine does the boring part and leaves the rules to you.
+
 ## What it is
 
 A tiny engine for making party games (Werewolf, Avalon, "Who is the Undercover", …) that friends play
@@ -11,13 +22,13 @@ provides the **shell** — HTTP server, room management, polling, voting gates, 
 
 It bundles three things an AI can't reason out, only accumulate through rework:
 
-1. **A battle-tested shell** — `engine.py`, shared by all games. Don't rewrite it.
+1. **A shared, reusable shell** — `engine.py`, abstracted out of working games. Don't rewrite it.
 2. **A pitfall map** — real bugs hit in production, especially environment-specific ones that are AI blind spots.
 3. **A kernel dictionary** — `kernels.md`, to classify any game and pick the right template (currently written in Chinese).
 
 ## Features
 
-- **Zero dependencies** — `http.server` + `threading` only. Nothing to `pip install`.
+- **Zero dependencies** — `http.server` + `threading` only; no third-party packages to `pip install`. ("No pip deps" ≠ "nothing to install": you still need Python 3.8+ and a tunnel like Tailscale to share the link.)
 - **Room lifecycle** — create / join / start / restart / force / disband / leave.
 - **Polling sync** — works behind Tailscale Funnel or any tunnel; no WebSocket needed for turn-based games.
 - **Two-step confirm + all-players gate** — irreversible actions require "select → change → confirm"; results settle only when everyone has submitted. No first-come-first-served races.
@@ -107,6 +118,16 @@ Three fields cover the common cases: `alive` (eliminated), `left` (left mid-game
         │   └── index.html #   the frontend
         └── start.bat      #   one-click start
 ```
+
+## Security & scope
+
+This is a party-game engine for a **semi-trusted circle** — friends, family, colleagues — not an anonymous-facing public product. It's written with that threat model in mind:
+
+- Each player gets a **server-issued secret**; requests are authorized against it, so knowing a room code alone isn't enough to hijack a seat.
+- Basic hardening is built in: creation rate-limiting, room TTL reaping, and a request-body size cap.
+- State lives in memory on whoever runs the server; nothing is sent to any third party.
+
+Honest boundaries: there's no account system or audit log, room codes are short (for easy sharing), and anyone you hand the link to can in principle join. Don't run it for strangers, and don't put anything sensitive in chat.
 
 ## License
 
